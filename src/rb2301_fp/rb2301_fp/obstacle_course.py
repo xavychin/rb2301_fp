@@ -108,6 +108,12 @@ class ObstacleCourseNode(Node):
 
         self.pose = None
 
+        ##Variables
+        self.prev_dir = "front"   # Travel direction: "front", "left", "rear" or "right"
+        self.dir = 0.2            # Strafe side when blocked: > 0 is left of travel, < 0 is right of travel
+        self.turning = False      # True while dodging an obstacle ahead
+        self.last_scan = None
+
     def sub_scan_callback(self, msg):
         """Scan subscriber"""
         if len(msg.ranges) <= 360:
@@ -169,7 +175,120 @@ class ObstacleCourseNode(Node):
 
         ###### INSERT CODE HERE ######
         self.get_logger().info(f"Pose: {self.pose}")
-        self.move_2D(0.1)
+
+        if self.last_scan is None:
+            return # No LiDAR scan received yet
+
+        # Minimum distance in each direction.
+        sectors = {
+            "front":       list(range(338, 360)) + list(range(0, 23)),
+            "front_left":  range(23, 68),
+            "left":        range(68, 113),
+            "rear_left":   range(113, 158),
+            "rear":        range(158, 203),
+            "rear_right":  range(203, 248),
+            "right":       range(248, 293),
+            "front_right": range(293, 338),
+        }
+
+        distance = {
+            name: np.min(np.take(self.last_scan, indices, mode="wrap"))
+            for name, indices in sectors.items()
+        }
+
+        limits = {
+            "front":       0.20,
+            "front_right": 0.20,
+            "right":       0.10,
+            "rear_right":  0.20,
+            "rear":        0.30,
+            "rear_left":   0.20,
+            "left":        0.10,
+            "front_left":  0.20,
+        }
+
+        # A direction is clear only when its main sector
+        # and both adjacent diagonal sectors are clear.
+        direction_sectors = {
+            "front": ("front_left", "front", "front_right"),
+            "right": ("front_right", "right", "rear_right"),
+            "left":  ("front_left", "left", "rear_left"),
+            "rear":  ("rear_left", "rear", "rear_right"),
+        }
+
+        # Priority order: direction, forward speed, sideways speed.
+        rules = [
+            ("front",  0.2,  0.0),
+            ("right",  0.0, -0.2),
+            ("left",   0.0,  0.2),
+            ("rear",  -0.2,  0.0),
+        ]
+
+        velocity = {direction: np.array((forward, sideways)) for direction, forward, sideways in rules}
+        CLEAR = 0.15 # Extra margin ahead before a dodge is finished
+
+        # Sectors in anticlockwise order, so the sectors relative to the
+        # travel direction are found by stepping round the ring.
+        ring = ["front", "front_left", "left", "rear_left",
+                "rear", "rear_right", "right", "front_right"]
+        i = ring.index(self.prev_dir)
+        ahead, ahead_left, left_side, behind_left = (ring[(i + k) % 8] for k in range(4))
+        behind, behind_right, right_side, ahead_right = (ring[(i + k) % 8] for k in range(4, 8))
+
+        def too_close(sector, margin=0.0):
+            return distance[sector] <= limits[sector] + margin
+
+        def blocked(direction):
+            return any(too_close(sector) for sector in direction_sectors[direction])
+
+        def go(*moves):
+            '''Move along the sum of (direction, scale) pairs.'''
+            forward, sideways = sum(velocity[direction] * scale for direction, scale in moves)
+            self.move_2D(forward, sideways, 0.0)
+
+        self.get_logger().debug(str(distance))
+
+        if too_close(ahead):
+            if not self.turning:
+                self.turning = True
+                self.dir = -self.dir # Dodge to the other side from last time
+
+            elif blocked(left_side):
+                self.dir = -0.2
+
+            elif blocked(right_side):
+                self.dir = 0.2
+
+            if blocked(left_side) and blocked(right_side):
+                if blocked(behind):
+                    self.move_2D(0.0, 0.0, 0.0) # Boxed in on all sides
+                else:
+                    go((behind, 1.0)) # Dead end: back away
+            else:
+                go((left_side if self.dir > 0 else right_side, 1.0))
+
+        elif too_close(left_side):
+            go((right_side, 0.5))
+
+        elif too_close(right_side):
+            go((left_side, 0.5))
+
+        elif too_close(ahead_left):
+            go((right_side, 1.0))
+
+        elif too_close(ahead_right):
+            go((left_side, 1.0))
+
+        elif too_close(behind_left):
+            go((ahead, 1.0), (right_side, 0.5))
+
+        elif too_close(behind_right):
+            go((ahead, 1.0), (left_side, 0.5))
+
+        else:
+            if not too_close(ahead, CLEAR):
+                self.turning = False
+            go((ahead, 1.0))
         ###### INSERT CODE HERE ######
                 
 
