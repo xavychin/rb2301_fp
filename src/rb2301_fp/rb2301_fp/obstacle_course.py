@@ -170,8 +170,10 @@ class ObstacleCourseNode(Node):
             return # Calibration mode: look, don't drive
 
         ###### INSERT CODE HERE ######
-        # Map-as-you-go navigation. Nothing about the course is assumed: the robot maps what its LiDAR sees, heads for the
-        # reachable frontier farthest (along the path) from where it started, and times its crossing of anything it sees moving.
+        # Map-as-you-go navigation. The robot maps what its LiDAR sees and heads for the reachable frontier farthest (along
+        # the path) from where it started, until it finds the gate (a gap in a long thin wall). It lines up with it, goes
+        # straight through, watches the moving obstacles beyond, then goes along the closer side wall past them, waiting
+        # short of each while it is in front or coming this way, and stops once past N_MOVING of them.
         import heapq # standard library: priority queue for the shortest-path search
         import time  # standard library: monotonic clock
         import types # standard library: SimpleNamespace for the navigation state
@@ -182,11 +184,10 @@ class ObstacleCourseNode(Node):
         PLAN_PERIOD = 0.5   # replanning period [s]
         LOOKAHEAD = 0.3     # pure pursuit lookahead [m]
         ZONE_MEMORY = 30.0  # how long a cell stays marked as "something moves here" [s]
-        DASH_SIDE = 0.5     # while dashing past a moving obstacle, also slide behind it: sideways speed per forward speed
         SWEEP_MEMORY = 10.0 # how long the rest of a moving obstacle's line stays marked after it was last seen moving [s]
         GATE_WATCH = 2.0    # at the gate, stop this long to watch the moving obstacles beyond it [s]
         N_MOVING = 2        # moving obstacles past the gate: the robot stops once it is past this many
-        CROSS_MARGIN = 0.06 # clearance kept from a moving obstacle when timing a crossing [m], growing by 0.015 m per second ahead
+        WALL_GAP = 0.12     # past the gate: clearance kept between the robot and the side wall it goes along [m]
         # The robot only. Sim values are from the URDF; check the real ones. lidar_yaw_deg is where the LiDAR's 0 rad
         # points, counter-clockwise from robot forward (the start-up log line shows the bearing of the nearest object).
         ROBOT = {True:  dict(half_width=0.11, half_length=0.14, body_offset=0.07, lidar_x=0.114, lidar_yaw_deg=180.0),
@@ -211,13 +212,15 @@ class ObstacleCourseNode(Node):
             nav.scan, nav.scan_seq, nav.used_seq = None, 0, 0
             nav.points = None # latest scan in the world frame: x, y, is_dynamic
             nav.tracks = [] # moving objects in the latest scan: dict(p, v, r, moving)
-            nav.first_motion = None # time the first moving object was seen
             nav.gate_pos, nav.zone_entry = None, None # where the gate is; where the robot last went into a zone
             nav.gate_watch = None # time the robot, crossed and facing front, started watching
             nav.gate_time = None # time the robot found the gate just ahead
             nav.cross_time = None # time the robot crossed through the gate into the final section: moving obstacles are
                                   # only looked for and avoided from then on
             nav.lines, nav.passed = [], [] # moving obstacles' lines of travel (how far past the gate), and those passed
+            nav.wall_lat, nav.wall_phase = None, "to wall" # "wall": the lane by the wall (sideways from the gate's centre)
+            nav.wall_going, nav.wall_why = None, None # the obstacle line being crossed (committed), and the last decision
+            nav.wall_still = None # (time, place) the robot was last seen moving, going to the wall
             nav.trail = [] # the robot's last metre of positions
             nav.gate_lineup = None # where it lines up with the gate
             nav.gate_phase = None # "line up", then "through" (see the gate steps in drive)
@@ -227,13 +230,8 @@ class ObstacleCourseNode(Node):
             nav.in_zone = nav.crossed = False # crossed: through the gate, into the final section
             nav.travel = np.zeros(2) # smoothed direction of travel
             nav.last_c = None
-            nav.dash_side = None # sideways direction (unit, world frame, or zero) to slide in during the current dash
-            nav.dash_start, nav.dash_room = None, 0.0 # where the dash started, and how far sideways there is room to slide
             nav.old_scans = [] # recent scans (t, lidar x, lidar y, first beam angle, ranges) for the slow-obstacle test
-            nav.speeds, nav.vpeak = [], 0.0 # recent speeds of moving objects (t, speed), and their usual top speed
-            nav.dash_ratio = None # robot's real speed per commanded speed while dashing, once measured
-            nav.reach_cache, nav.now = {}, 0.0
-            nav.dash_hist = [] # (time, position) over the current stretch of full-speed dashing, to measure it
+            nav.now = 0.0
 
             def scan_cb(msg): # own copy of the scan, with the beam angles
                 step = max(1, len(msg.ranges) // 400)
@@ -418,14 +416,6 @@ class ObstacleCourseNode(Node):
                     nav.dyn_time[o["cells"]] = now
                     if nav.crossed and o["vdir"] is not None and now - o["since"] >= 1.0 and np.linalg.norm(o["v"]) > 0.15: # surely moving
                         sweep(o, now)
-                    if nav.crossed: # until crossed into the final section, moving things are only kept out of the map of
-                        nav.first_motion = nav.first_motion or now # walls (else they would wall it in): nothing is avoided
-                    if np.linalg.norm(o["v"]) > 0.1:
-                        nav.speeds.append((now, float(np.linalg.norm(o["v"]))))
-            # Moving obstacles speed up and slow down (they are slow near where they turn around): their top speed, robust
-            # to the odd bad velocity estimate, is used when predicting them too
-            nav.speeds = [s for s in nav.speeds if s[0] > now - 20.0]
-            nav.vpeak = float(np.percentile([s[1] for s in nav.speeds], 85)) if len(nav.speeds) >= 10 else 0.0
             # One object seen in pieces counts once: of moving ones closer than 0.35 m, only the biggest
             seen_movers = sorted([o for o in objects if o["moving"]], key=lambda o: -o["a"])
             kept = []
@@ -450,7 +440,6 @@ class ObstacleCourseNode(Node):
                     if not any(same(k) for k in kept): # (not if it is back in view already: near it, or on its line of travel)
                         objects.append(q)
             nav.tracks = objects
-            nav.reach_cache.clear() # positions changed
             nav.seen_zone = dilate((now - nav.dyn_time) < ZONE_MEMORY, 2) # where things have been seen moving
             nav.zone = nav.seen_zone | dilate((now - nav.sweep_time) < SWEEP_MEMORY, 2) # and where they may move
 
@@ -599,213 +588,99 @@ class ObstacleCourseNode(Node):
             ns = perp(through) # the middle of the gap, square to the way through it
             return through, p + ns * (clear(p, ns) - clear(p, -ns)) / 2
 
-        def side_room(c, side, ahead=None):
-            '''How far the robot can slide towards side before it gets close to a wall [m]: from c, and all along the path
-            ahead for 0.8 m (e.g. through a gate). Walls count even where something moves next to them.'''
-            if not side.any():
-                return 0.0
-            starts = [c] if ahead is None else [c] + [q for q in ahead if math.dist(q, c) < 0.8][::3]
-            ks = np.arange(1, int(0.8 / RES)) * RES
-            room = 0.8
-            for q in starts:
-                pi, pj = cell(q[0] + ks * side[0], q[1] + ks * side[1])
-                pi, pj = np.clip(pi, 0, nav.n - 1), np.clip(pj, 0, nav.n - 1)
-                wall = (nav.logodds[pi, pj] > 0.6) & ((nav.now - nav.dyn_time[pi, pj]) >= ZONE_MEMORY)
-                if wall.any():
-                    room = min(room, float(ks[np.argmax(wall)] + (q - c) @ side))
-            return max(0.0, room - nav.robot["half_width"] - 0.08)
+        def wall_follow(c, h, now):
+            '''Past the gate: past the moving obstacles along the closer side wall, facing front. Their tracks end at the
+            walls, so there each one only has to be let by: wait short of its path while it is in front or coming this way,
+            else go across. Nearest first. Returns (direction, speed, heading error to face front [deg], what it is doing).'''
+            hl, hw = nav.robot["half_length"], nav.robot["half_width"]
+            u, n = nav.gate_dir, perp(nav.gate_dir) # straight on through the gate, and to its left
+            along, lat = float((c - nav.gate_pos) @ u), float((c - nav.gate_pos) @ n)
+            face = wrap_deg(math.degrees(math.atan2(u[1], u[0]) - h))
+            if nav.wall_lat is None: # which wall is closer, once: the free distance each way, square to the way through
+                ks = np.arange(1, int(2.0 / RES)) * RES
+                room = {}
+                for sgn in (1.0, -1.0):
+                    q = c + ks[:, None] * (sgn * n)
+                    pi, pj = cell(q[:, 0], q[:, 1])
+                    pi, pj = np.clip(pi, 0, nav.n - 1), np.clip(pj, 0, nav.n - 1)
+                    wall = (nav.logodds[pi, pj] > 0.6) & ((now - nav.dyn_time[pi, pj]) >= ZONE_MEMORY) & ((now - nav.sweep_time[pi, pj]) >= SWEEP_MEMORY)
+                    room[sgn] = float(ks[np.argmax(wall)]) if wall.any() else 2.0
+                sgn = 1.0 if room[1.0] <= room[-1.0] else -1.0
+                nav.wall_lat = lat + sgn * max(0.0, room[sgn] - hw - WALL_GAP)
+                log.info(f"Final zone: to the {'left' if sgn > 0 else 'right'} wall, {room[sgn]:.2f} m away (the other is {room[-sgn]:.2f} m)")
+            off = nav.wall_lat - lat # how far the robot is from its lane by the wall
+            if nav.wall_phase == "to wall":
+                if nav.wall_still is None or math.dist(c, nav.wall_still[1]) > 0.02:
+                    nav.wall_still = (now, c.copy()) # (when it last moved: slowing by the wall, it may stop a little short)
+                if abs(off) > 0.06 and now - nav.wall_still[0] < 1.5:
+                    return n * np.sign(off), min(0.25, max(0.15, 2.0 * abs(off))), face, "to wall"
+                nav.wall_phase, nav.wall_lat = "along", lat # the lane is where it got to
+                log.info(f"At the wall ({c[0]:.2f}, {c[1]:.2f}): going along it")
+            fwd = u + n * float(np.clip(2.0 * off, -0.5, 0.5)) # forward, keeping to the lane
+            fwd = fwd / np.linalg.norm(fwd)
+            ahead = [d for d in sorted(nav.lines) if d not in nav.passed] # obstacles' lines still to cross, nearest first
+            if nav.wall_going is not None: # crossing one: never stop in its path
+                if nav.wall_going in ahead:
+                    return fwd, nav.dash, face, "going"
+                nav.wall_going = None
+            # Where to stop short of the next one: its line, or (not known yet) where things were seen moving on the lane
+            stop, line = None, None
+            if ahead:
+                line = ahead[0]
+                stop = line - hl - WALL_GAP - 0.03
+            ts = np.arange(RES, 1.5, RES)
+            q = c + ts[:, None] * u
+            pi, pj = cell(q[:, 0], q[:, 1])
+            moved = nav.seen_zone[np.clip(pi, 0, nav.n - 1), np.clip(pj, 0, nav.n - 1)]
+            if moved.any() and (stop is None or along + ts[np.argmax(moved)] - hl - 0.05 < stop - 0.1):
+                stop, line = along + ts[np.argmax(moved)] - hl - 0.05, None # something moving there not known yet: wait
+            if stop is None: # nothing (known to be) moving ahead: on, gently
+                return fwd, 0.5 * nav.cruise, face, "along"
+            go, why = False, "not seen yet"
+            if line is not None:
+                movers = [o for o in nav.tracks if o["moving"] and abs(float((o["p"] - nav.gate_pos) @ u) - line) < 0.3]
+                if movers:
+                    go, why = True, "moving away"
+                    for o in movers:
+                        plat, vlat = float((o["p"] - nav.gate_pos) @ n), float(o["v"] @ n)
+                        half = o["a"] * abs(float(o["e"] @ n)) + o["b"] * abs(float(perp(o["e"]) @ n)) # its half length across
+                        if abs(plat - nav.wall_lat) < half + hw + 0.15:
+                            go, why = False, "in front"
+                        elif (nav.wall_lat - plat) * vlat > 0 and abs(vlat) > 0.05:
+                            go, why = False, f"coming this way at {abs(vlat):.2f} m/s"
+            k = len(nav.passed) + 1
+            if (k, why.split(" at ")[0]) != nav.wall_why: # (once each time the decision changes, not with every speed)
+                nav.wall_why = (k, why.split(" at ")[0])
+                log.info(f"Obstacle {k} {why}: " + ("going across" if go else f"waiting short of it"))
+            if go:
+                if along >= stop - 0.03: # at the stopping point (or past it) and clear: committed
+                    nav.wall_going = line
+                return fwd, nav.dash, face, "go"
+            gap = stop - along
+            if gap > 0.02:
+                return fwd, float(np.clip(1.5 * gap, 0.12, nav.cruise)), face, "to stop"
+            return fwd, 0.0, face, "waiting"
 
-        def reach(o, w, now, to_walls=False):
+        def reach(o, w, now):
             '''Range (lo <= 0 <= hi) along unit w that the object's centre moves in, relative to where it is now: it turns
-            around at the far ends of the cells it has been seen moving through (to_walls: or goes on to the walls).'''
-            key = (id(o), round(float(w[0]), 3), round(float(w[1]), 3), to_walls, now)
-            if key not in nav.reach_cache:
-                if len(nav.reach_cache) > 500:
-                    nav.reach_cache.clear()
-                nav.reach_cache[key] = reach_uncached(o, w, now, to_walls)
-            return nav.reach_cache[key]
-
-        def to_wall(o, w, now):
-            '''How far the object's centre can go along unit w before it would reach a wall (from the map) [m].'''
-            e, n = o["e"], perp(o["e"])
-            half = o["a"] * abs(float(e @ w)) + o["b"] * abs(float(n @ w))
-            ks = np.arange(0.0, 2.0, RES)
-            line = o["p"] + (half + ks)[:, None] * w
-            li, lj = cell(line[:, 0], line[:, 1])
-            ok = (li >= 0) & (li < nav.n) & (lj >= 0) & (lj < nav.n)
-            li, lj = np.clip(li, 0, nav.n - 1), np.clip(lj, 0, nav.n - 1)
-            wall = ok & (nav.logodds[li, lj] > 0.6) & ((now - nav.dyn_time[li, lj]) >= ZONE_MEMORY)
-            return float(ks[np.argmax(wall)]) if wall.any() else 2.0
-
-        def reach_uncached(o, w, now, to_walls):
-            if to_walls: # it may go on to the walls, where it has not been seen yet (seen further on: it turns where seen)
-                lo, hi = reach_uncached(o, w, now, False)
-                return (lo if lo < -0.3 else -to_wall(o, -w, now)), (hi if hi > 0.3 else to_wall(o, w, now))
+            around at the far ends of the cells it has been seen moving through.'''
             ci, cj = cell(o["p"][0], o["p"][1])
             R = int(1.5 / RES)
             i0, j0 = max(int(ci) - R, 0), max(int(cj) - R, 0)
-            seen = (now - nav.dyn_time[i0:int(ci) + R + 1, j0:int(cj) + R + 1]) < ZONE_MEMORY
-            if to_walls:
-                seen |= (now - nav.sweep_time[i0:int(ci) + R + 1, j0:int(cj) + R + 1]) < SWEEP_MEMORY
-            ii, jj = np.nonzero(seen)
+            ii, jj = np.nonzero((now - nav.dyn_time[i0:int(ci) + R + 1, j0:int(cj) + R + 1]) < ZONE_MEMORY)
             rel = nav.origin + (np.stack([ii + i0, jj + j0], 1) + 0.5) * RES - o["p"]
             e, n = o["e"], perp(o["e"])
             half = lambda u: o["a"] * abs(float(e @ u)) + o["b"] * abs(float(n @ u)) # object's half size along u
-            s = np.sort(rel[np.abs(rel @ perp(w)) < half(perp(w)) + 0.08] @ w)
-            if len(s) == 0:
+            s_ = np.sort(rel[np.abs(rel @ perp(w)) < half(perp(w)) + 0.08] @ w)
+            if len(s_) == 0:
                 return 0.0, 0.0
-            k = int(np.argmin(np.abs(s)))
-            if abs(s[k]) > 0.2:
+            k = int(np.argmin(np.abs(s_)))
+            if abs(s_[k]) > 0.2:
                 return 0.0, 0.0
-            breaks = np.nonzero(np.diff(s) > 0.12)[0] # the stretch it moves along: no gaps, starting from where it is
-            lo = s[breaks[breaks < k].max() + 1] if (breaks < k).any() else s[0]
-            hi = s[breaks[breaks >= k].min()] if (breaks >= k).any() else s[-1]
+            breaks = np.nonzero(np.diff(s_) > 0.12)[0] # the stretch it moves along: no gaps, starting from where it is
+            lo = s_[breaks[breaks < k].max() + 1] if (breaks < k).any() else s_[0]
+            hi = s_[breaks[breaks >= k].min()] if (breaks >= k).any() else s_[-1]
             return min(0.0, lo - RES / 2 + half(w)), max(0.0, hi + RES / 2 - half(w))
-
-        def futures(o):
-            '''Ways the object may move: (unit direction, speed). Its own speed, slowing down, or speeding up to the usual top
-            speed (e.g. after turning around). If it is (nearly) still, it may be turning around: either way along its track.'''
-            # A spread of speeds, not just the slowest and fastest: one speeding up is somewhere in between, and may be just
-            # where the robot is when the fastest would already be past it and the slowest not there yet
-            # Returns (unit direction, top speed, acceleration or None for a steady speed)
-            sp = float(np.linalg.norm(o["v"]))
-            if sp > 0.1:
-                w = o["v"] / sp
-                return [(w, float(v), None) for v in np.linspace(0.7 * sp, max(sp, nav.vpeak), 5)]
-            ways = [(np.array([1.0, 0.0]), 0.0, None)]
-            if o["vdir"] is not None and nav.vpeak > 0.1: # (assuming it may set off at once is cautious: modelling it
-                # speeding up gradually instead let the robot cross more often, but it was hit more often too)
-                ways += [(d * o["vdir"], float(v), None) for d in (1.0, -1.0) for v in np.linspace(0.1, nav.vpeak, 4)]
-            return ways
-
-        def predict(o, ts, w, sp, now, to_walls, acc=None):
-            '''Centre of the object at times ts, moving along unit w at speed sp (or from rest with acceleration acc, up to sp)
-            and turning around at the ends of its track: where it has been seen turning around, or (to_walls) the walls.'''
-            if sp <= 0.0:
-                return np.repeat(o["p"][None, :], len(ts), 0)
-            lo, hi = reach(o, w, now, to_walls)
-            L = hi - lo
-            if acc: # distance gone: speeding up from rest, then steady at sp
-                t1 = sp / acc
-                dist = np.where(ts < t1, 0.5 * acc * ts ** 2, 0.5 * sp * t1 + sp * (ts - t1))
-            else:
-                dist = sp * ts
-            if L < 1e-3:
-                pos = np.zeros(len(ts))
-            else:
-                m = np.mod(dist - lo, 2 * L)
-                pos = lo + L - np.abs(m - L) # bounces between lo and hi
-            return o["p"] + pos[:, None] * w
-
-        def hits(q, fwd, oc, o, ts):
-            '''Does the robot (centres q, facing fwd) overlap the object (centres oc) at any of the times ts? Both are boxes.'''
-            hl, hw = nav.robot["half_length"], nav.robot["half_width"]
-            m = CROSS_MARGIN + 0.015 * ts
-            l, e, n = perp(fwd), o["e"], perp(o["e"])
-            d = oc - q
-            apart = np.zeros(len(ts), bool)
-            for u in (fwd, l, e, n): # separating axis test
-                r = (hl + m) * abs(float(fwd @ u)) + (hw + m) * abs(float(l @ u)) + o["a"] * abs(float(e @ u)) + o["b"] * abs(float(n @ u))
-                apart |= np.abs(d @ u) > r
-            return bool((~apart).any())
-
-        def behind(p_in, left):
-            '''Side to slide to while crossing at p_in: behind the nearest moving object, i.e. opposite to the way it is moving
-            across the path (seen moving left to right: slide left). If it is not moving across, away from it.'''
-            near = [o for o in nav.tracks if o["moving"] and np.linalg.norm(o["p"] - p_in) < 1.2]
-            if not near:
-                return np.zeros(2), "nothing moving near the crossing"
-            o = min(near, key=lambda o: np.linalg.norm(o["p"] - p_in))
-            across = float(o["v"] @ left)
-            sp = float(np.linalg.norm(o["v"]))
-            if abs(across) > 0.1 and sp > 0.1 and reach(o, o["v"] / sp, nav.now)[1] < 0.25 and to_wall(o, o["v"] / sp, nav.now) < 0.35: # at its end: about to turn
-                return (left if across > 0 else -left), f"object about to turn around, then move {'right' if across > 0 else 'left'}"
-            if abs(across) > 0.1:
-                return (-left if across > 0 else left), f"object moving {'left' if across > 0 else 'right'} at {abs(across):.2f} m/s"
-            if o["vdir"] is not None and abs(float(o["vdir"] @ left)) > 0.5: # stopped to turn around: about to go back
-                nxt = -float(o["vdir"] @ left)
-                return (-left if nxt > 0 else left), f"object turning around, about to move {'left' if nxt > 0 else 'right'}"
-            off = float((o["p"] - p_in) @ left)
-            if abs(off) > 0.05:
-                return (-left if off > 0 else left), f"object on the {'left' if off > 0 else 'right'}, not moving across"
-            return np.zeros(2), "object right in the lane"
-
-        def crossing(c, ahead, now):
-            '''Moving obstacles on the path ahead: ("clear",), ("wait", distance left to the stopping point) or
-            ("dash", sideways unit vector to slide in while crossing (zero: straight), reason).'''
-            hl = nav.robot["half_length"]
-            cum = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(ahead, axis=0).T))]) + np.hypot(*(ahead[0] - c))
-            keep = cum <= 1.5
-            ahead, cum = ahead[keep], cum[keep]
-            ci, cj = cell(ahead[:, 0], ahead[:, 1])
-            inzone = nav.zone[np.clip(ci, 0, nav.n - 1), np.clip(cj, 0, nav.n - 1)]
-            if not inzone.any():
-                return ("clear",)
-            k_in = int(np.argmax(inzone))
-            s_in, p_in = cum[k_in], ahead[k_in]
-            ci_in, cj_in = np.clip(ci[k_in], 0, nav.n - 1), np.clip(cj[k_in], 0, nav.n - 1)
-            tangent = ahead[min(k_in + 4, len(ahead) - 1)] - ahead[max(k_in - 4, 0)] # direction of the path through the zone
-            fwd = tangent / np.linalg.norm(tangent) if np.linalg.norm(tangent) > 1e-6 else (p_in - c) / max(np.linalg.norm(p_in - c), 1e-6)
-            left = perp(fwd)
-            ci, cj = cell(c[0], c[1])
-            k = int(hl / RES)
-            # Any of the robot where something has been seen moving. (Only where it may move, not seen: check as usual)
-            inside = bool(nav.seen_zone[max(ci - k, 0):ci + k + 1, max(cj - k, 0):cj + k + 1].any())
-            if (s_in <= hl and nav.seen_zone[ci_in, cj_in]) or inside: # in a zone: never stop inside it (not even with only the back still in one)
-                if nav.dash_side is not None:
-                    return ("dash", nav.dash_side, "")
-                return ("dash",) + behind(p_in, left)
-            s_out, last = s_in, s_in
-            for s, z in zip(cum, inzone): # end of the zone, treating gaps too short to wait in as part of it
-                if z and s - last < 2 * hl + 0.04: # (only if the robot could not stop between them: else one at a time)
-                    s_out = s
-                if z:
-                    last = s
-            stop = s_in - hl - 0.08
-            # One moving obstacle at a time, nearest first: only those whose path this crossing goes over count (the next
-            # one is dealt with from the stopping point before it)
-            seg = ahead[(cum >= s_in - 0.1) & (cum <= s_out + 0.1)]
-            if len(seg) == 0:
-                seg = ahead[k_in:k_in + 1]
-            def in_this(o):
-                if o["vdir"] is not None: # its line of travel crosses this stretch of path
-                    return float(np.min(np.abs((seg - o["p"]) @ perp(o["vdir"])))) < o["b"] + 0.25
-                return float(np.min(np.linalg.norm(seg - o["p"], axis=1))) < 0.6
-            movers = [o for o in nav.tracks if o["moving"] and in_this(o)]
-            if now - nav.first_motion < 2.0: # watch for a moment first, so speeds and turning points are known (not per
-                return ("wait", stop) # object: close up, they are lost and found again all the time, and it would never go)
-            if nav.dash_side is not None: # dash under way: keep its side, but still check it
-                options = [(nav.dash_side, "")]
-            else:
-                side, why = behind(p_in, left) # behind the obstacle first, then straight, then the other way
-                options = [(side, why)] + ([(np.zeros(2), why + ", no window sliding behind it"),
-                                            (-side, why + ", no window sliding behind it or going straight")] if side.any() else [])
-            # The robot's real dash speed, as measured on earlier dashes (until then: somewhere from 80% to 100% of commanded)
-            v_lo, v_hi = (0.9 * nav.dash_ratio * nav.dash, min(1.05 * nav.dash_ratio, 1.0) * nav.dash) if nav.dash_ratio else (0.8 * nav.dash, nav.dash)
-            for side, why in options:
-                room = nav.dash_room - float((c - nav.dash_start) @ side) if nav.dash_side is not None else side_room(c, side, ahead)
-                k = DASH_SIDE if side.any() else 0.0
-                ok = True
-                for v in (v_lo, v_hi): # the robot's real speed is not known exactly: it must work for both
-                    vf, vs = v / math.hypot(1.0, k), v * k / math.hypot(1.0, k) # forward and sideways speed
-                    ts = np.arange(0.0, (s_out + hl + 0.05) / vf + 0.3, 0.1)
-                    tr = np.maximum(ts - 0.1, 0.0) # it takes a moment to get going
-                    q = np.stack([np.interp(vf * tr, cum, ahead[:, 0]), np.interp(vf * tr, cum, ahead[:, 1])], 1)
-                    q = q + np.minimum(vs * tr, max(room, 0.0))[:, None] * side
-                    heading_dir = (fwd * vf + side * vs) / v
-                    for o in movers:
-                        # where it turns around is not known for sure: it must miss the robot either way
-                        for w, sp, acc, to_walls in [(w, sp, acc, tw) for w, sp, acc in futures(o) for tw in ((False, True) if sp > 0 else (False,))]:
-                            if hits(q, heading_dir, predict(o, ts, w, sp, now, to_walls, acc), o, ts):
-                                ok = False
-                                break
-                        if not ok:
-                            break
-                    if not ok:
-                        break
-                if ok:
-                    return ("dash", side, why)
-            return ("wait", stop)
 
         def brake_factor(c, h, direction, dashing):
             '''Speed factor in [0, 1] from the raw scan in the direction of motion (moving things ignored while dashing),
@@ -888,7 +763,6 @@ class ObstacleCourseNode(Node):
                     nav.cross_time, nav.crossed = now, True
                     for o in nav.tracks: # start afresh: only what is seen moving from now on counts
                         o.update(moving=False, n=0, since=None, vdir=None, origin=o["p"].copy())
-                    nav.speeds = []
                     log.info(f"Crossed into the final section at ({c[0]:.2f}, {c[1]:.2f}), heading {math.degrees(h):.0f} deg")
                 if nav.cross_time is None and nav.gate_phase == "line up":
                     if (math.dist(c, line_up) < 0.05 and abs(face_err) < 4.0) or now - nav.gate_time > 8.0:
@@ -897,7 +771,8 @@ class ObstacleCourseNode(Node):
                 if nav.cross_time is not None and (abs(face_err) < 4.0 or now - nav.cross_time > 4.0):
                     nav.gate_watch, gate_ctl = now, False
                     log.info(f"Facing front (heading {math.degrees(h):.0f} deg): watching for moving obstacles for {GATE_WATCH:.0f} s")
-            mode = crossing(c, P[i:], now) if nav.first_motion and nav.crossed and not gate_ctl else ("clear",)
+            mode = ("clear",)
+            wall_ctl = nav.gate_watch is not None and now - nav.gate_watch >= GATE_WATCH # along the wall, from the watch on
             if gate_ctl or (nav.gate_watch is not None and now - nav.gate_watch < GATE_WATCH):
                 mode = ("wait", 0.0) # (the gate steps set the motion; watching: stay put)
             if mode[0] == "clear": # look before entering space just seen, so anything moving there shows itself
@@ -908,42 +783,14 @@ class ObstacleCourseNode(Node):
                     mode = ("wait", d[i:][d[i:] < 0.6 + nav.robot["half_length"]][np.argmax(fresh)] - nav.robot["half_length"] - 0.05)
             if mode[0] == "wait":
                 speed = min(speed, max(0.0, 1.5 * mode[1]))
-            elif mode[0] == "dash":
-                speed = 0.0 if nav.goal_final and to_goal < 0.05 else nav.dash # (arrived: nowhere to dash to)
-                if nav.dash_side is None:
-                    # Cross diagonally, behind the moving obstacle: the side crossing() checked. Kept for the whole dash,
-                    # so it does not zig-zag, and only as far sideways as there is room
-                    nav.dash_side, nav.dash_start = mode[1], c.copy()
-                    nav.dash_room = side_room(c, mode[1], P[i:])
-                    if norm > 1e-3:
-                        way = "straight" if not mode[1].any() else ("left" if direction[0] * mode[1][1] - direction[1] * mode[1][0] > 0 else "right")
-                        ratio = "not measured yet" if nav.dash_ratio is None else f"{nav.dash_ratio * nav.dash:.2f} m/s"
-                        log.info(f"dash at ({c[0]:.2f}, {c[1]:.2f}): {mode[2]}, going {way} (room {nav.dash_room:.2f} m, real dash speed {ratio})")
-                if nav.dash_side.any():
-                    # Move as crossing() predicted: along the path at forward speed, sliding sideways at DASH_SIDE times that
-                    # until the room is used up. Head for that point 0.4 s ahead (just adding a sideways push is not enough:
-                    # following the path pulls the robot back to it, and it would slide far less than predicted)
-                    side = nav.dash_side
-                    vf = nav.dash / math.hypot(1.0, DASH_SIDE)
-                    seg = np.hypot(*np.diff(P[i:], axis=0).T)
-                    cum_p = np.concatenate([[0.0], np.cumsum(seg)])
-                    s_ahead = min(vf * 0.4, cum_p[-1])
-                    base = np.array([np.interp(s_ahead, cum_p, P[i:, 0]), np.interp(s_ahead, cum_p, P[i:, 1])])
-                    off_now = float((c - nav.dash_start) @ side)
-                    off_target = min(off_now + DASH_SIDE * vf * 0.4, nav.dash_room)
-                    target = base + side * (off_target - float((P[i] - nav.dash_start) @ side))
-                    if np.linalg.norm(target - c) > 1e-3:
-                        direction = (target - c) / np.linalg.norm(target - c)
-            if mode[0] != "dash":
-                nav.dash_side = None
             if norm > 1e-3:
-                brake, block = brake_factor(c, h, direction, mode[0] == "dash")
+                brake, block = brake_factor(c, h, direction, False)
                 if brake < 0.2: # blocked: slide along the obstacle instead of pushing into it
                     away = block / np.linalg.norm(block)
                     slide = direction - (direction @ away) * away
                     if np.linalg.norm(slide) > 0.3:
                         direction = slide / np.linalg.norm(slide)
-                        brake = 0.5 * brake_factor(c, h, direction, mode[0] == "dash")[0]
+                        brake = 0.5 * brake_factor(c, h, direction, False)[0]
                 speed *= brake
             err = wrap_deg(math.degrees(math.atan2(direction[1], direction[0]) - h)) if norm > 1e-3 else 0.0
             if gate_ctl: # the gate steps: head for the step's spot, facing front (the robot can drive sideways)
@@ -957,21 +804,16 @@ class ObstacleCourseNode(Node):
                     speed = min(0.25, max(0.12, 2.0 * gap)) # (slower may not move it at all)
                 else:
                     speed = 0.0
+            if wall_ctl:
+                direction, speed, err, doing = wall_follow(c, h, now)
+                mode = (doing,)
+                if speed > 0: # (stop for walls, but not for the moving obstacles)
+                    speed *= brake_factor(c, h, direction, True)[0]
             turn = float(np.clip(2.0 * math.radians(err), -nav.turn_max, nav.turn_max)) # face the direction of travel
-            if gate_ctl and abs(err) > 2.0: # (slower than this, the robot may not turn at all)
+            if (gate_ctl or wall_ctl) and abs(err) > 2.0: # (slower than this, the robot may not turn at all)
                 turn = math.copysign(max(abs(turn), 0.5), err)
-            if abs(err) > 45 and mode[0] != "dash":
+            if abs(err) > 45 and not wall_ctl:
                 speed *= 0.5
-            # Measure how fast the robot really goes for the speed it is told (over 0.6 s of steady driving), for timing crossings
-            if speed >= 0.6 * nav.dash and (not nav.dash_hist or abs(speed - nav.dash_hist[-1][2]) < 0.1 * nav.dash):
-                nav.dash_hist.append((now, c.copy(), speed))
-                if nav.dash_hist[-1][0] - nav.dash_hist[0][0] >= 0.6:
-                    told = sum((b[0] - a[0]) * a[2] for a, b in zip(nav.dash_hist, nav.dash_hist[1:])) # distance told to go
-                    r = float(np.clip(np.linalg.norm(nav.dash_hist[-1][1] - nav.dash_hist[0][1]) / told, 0.3, 1.1))
-                    nav.dash_ratio = r if nav.dash_ratio is None else 0.8 * nav.dash_ratio + 0.2 * r
-                    nav.dash_hist = [h_ for h_ in nav.dash_hist if h_[0] > now - 0.3]
-            else:
-                nav.dash_hist = []
             vx, vy = direction * speed
             bo = nav.robot["body_offset"] # command base_footprint so the body centre moves as asked
             vx, vy = vx + turn * bo * math.sin(h), vy - turn * bo * math.cos(h)
@@ -1021,7 +863,7 @@ class ObstacleCourseNode(Node):
 
         # ---- main loop, every tick ----
         # Clock: in Gazebo the simulation's (from the odometry), so a simulation running slower than real time does not upset
-        # the timing of crossings; on the real robot the computer's
+        # its timing; on the real robot the computer's
         now = self.sim_time if self.is_simulation and self.sim_time is not None else time.monotonic()
         nav.now = now
         if nav.scan is None:
@@ -1044,7 +886,7 @@ class ObstacleCourseNode(Node):
             integrate(x, y, h, now)
 
         # Plan: goal = reachable frontier farthest from the start, path to it, twice a second
-        if now - nav.last_plan > PLAN_PERIOD and nav.dash_side is None: # not during a dash: keep the path its timing was checked on
+        if now - nav.last_plan > PLAN_PERIOD:
             nav.last_plan = now
             plan_path(c)
 
